@@ -135,35 +135,12 @@ def create_multisite_draft_internal(site_id: str, title: str, content: str, exce
 
             site_url, secret = site
 
-            # 🔹 Récupérer anciens articles pour maillage interne
-cur.execute("""
-    SELECT title, wp_url
-    FROM articles
-    WHERE site_id = %s
-    ORDER BY created_at DESC
-    LIMIT 5
-""", (site_id,))
-
-related_articles = cur.fetchall()
-
-internal_block = ""
-
-if related_articles:
-    internal_block = "<h2>À lire aussi</h2><ul>"
-    for t, url in related_articles:
-        if url:
-            internal_block += f'<li><a href="{url}">{t}</a></li>'
-    internal_block += "</ul>"
-
-# Injecter à la fin du contenu
-content = content + internal_block
-
-            # 2️⃣ anti-duplicate
-            content_hash = sha256_hex(content)
+            # 2️⃣ anti-duplicate (hash sur contenu de base, AVANT maillage)
+            base_hash = sha256_hex(content)
 
             cur.execute(
                 "SELECT wp_post_id, wp_url FROM articles WHERE site_id = %s AND content_hash = %s",
-                (site_id, content_hash),
+                (site_id, base_hash),
             )
             duplicate = cur.fetchone()
 
@@ -174,7 +151,27 @@ content = content + internal_block
                     "wp_url": duplicate[1],
                 }
 
-            # 3️⃣ appel plugin WP (HMAC)
+            # 3️⃣ maillage interne simple (5 derniers)
+            cur.execute(
+                """
+                SELECT title, wp_url
+                FROM articles
+                WHERE site_id = %s AND wp_url IS NOT NULL
+                ORDER BY created_at DESC
+                LIMIT 5
+                """,
+                (site_id,),
+            )
+            related_articles = cur.fetchall()
+
+            if related_articles:
+                internal_block = "<h2>À lire aussi</h2><ul>"
+                for t, url in related_articles:
+                    internal_block += f'<li><a href="{url}">{t}</a></li>'
+                internal_block += "</ul>"
+                content = content + "\n\n" + internal_block
+
+            # 4️⃣ appel plugin WP (HMAC)
             wp_path = "/wp-json/llmgeo/v1/draft"
             wp_url = site_url.rstrip("/") + wp_path
             ts = str(int(time.time()))
@@ -202,7 +199,7 @@ content = content + internal_block
 
             wp_json = response.json()
 
-            # 4️⃣ enregistrer en base
+            # 5️⃣ enregistrer en base
             cur.execute(
                 """
                 INSERT INTO articles (
@@ -227,7 +224,7 @@ content = content + internal_block
                     content,
                     excerpt,
                     topic_key,
-                    content_hash,
+                    base_hash,
                 ),
             )
 
