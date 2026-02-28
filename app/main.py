@@ -1,7 +1,12 @@
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse
 import os
+import time
+import hmac
+import hashlib
+import json
 
+import psycopg
 import requests
 from requests.exceptions import ReadTimeout, RequestException
 
@@ -9,12 +14,40 @@ from app.wp import WordPressClient
 
 app = FastAPI()
 
-# Config via variables d'env (on mettra ensuite un vrai dashboard + DB)
+# =========================
+# ENV / CONFIG
+# =========================
 WP_BASE_URL = os.getenv("WP_BASE_URL", "").strip()
 WP_USERNAME = os.getenv("WP_USERNAME", "").strip()
 WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "").strip()
 
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    # On veut le moteur multi-site => DB obligatoire
+    # (sinon on ne peut pas récupérer les secrets HMAC par site)
+    raise RuntimeError("DATABASE_URL manquant")
 
+
+# =========================
+# HELPERS
+# =========================
+def hmac_sign(secret: str, method: str, path: str, ts: str, body: str) -> str:
+    """
+    Doit matcher EXACTEMENT le plugin WP (même canon, mêmes sauts de ligne).
+    Canon:
+      METHOD \n PATH \n TS \n BODY
+    """
+    payload = f"{method}\n{path}\n{ts}\n{body}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+# =========================
+# ROUTES
+# =========================
 @app.get("/health")
 def health():
     return {"status": "ok", "environment": os.getenv("ENVIRONMENT", "unknown")}
@@ -48,7 +81,7 @@ def dashboard():
         <h1>Dashboard</h1>
         <p>{status}</p>
 
-        <h2>Test : créer un brouillon WordPress</h2>
+        <h2>Test : créer un brouillon WordPress (mode legacy WP_* env)</h2>
         <form method="post" action="/wp/create-draft">
           <label>Titre</label><br/>
           <input name="title" style="width: 100%; padding: 8px" value="Test brouillon GEO"/><br/><br/>
@@ -63,11 +96,22 @@ def dashboard():
           </textarea><br/><br/>
           <button type="submit" style="padding: 10px 14px;">Créer le brouillon</button>
         </form>
+
+        <hr style="margin:2rem 0"/>
+
+        <h2>Multi-site (nouveau) : /sites/{{site_id}}/draft</h2>
+        <p>
+          Ce endpoint utilise la base (tables <code>sites</code>, <code>articles</code>) et le plugin WP (HMAC).
+          <br/>Il évite de recréer le même contenu via un hash.
+        </p>
       </body>
     </html>
     """
 
 
+# =========================
+# LEGACY endpoint (WP_* env)
+# =========================
 @app.post("/wp/create-draft", response_class=HTMLResponse)
 def create_draft(title: str = Form(...), content: str = Form(...)):
     if not (WP_BASE_URL and WP_USERNAME and WP_APP_PASSWORD):
@@ -79,7 +123,7 @@ def create_draft(title: str = Form(...), content: str = Form(...)):
     try:
         post = wp.create_draft_post(title=title, content_html=content, excerpt="Brouillon test LLM GEO Engine")
     except ReadTimeout:
-        # Important : WordPress peut avoir créé le brouillon même si on n'a pas reçu la réponse.
+        # WordPress peut avoir créé le brouillon même si on n'a pas reçu la réponse.
         return HTMLResponse(
             """
             <html><body style="font-family:sans-serif;margin:2rem;">
@@ -115,3 +159,105 @@ def create_draft(title: str = Form(...), content: str = Form(...)):
       <p><a href="/dashboard">Retour dashboard</a></p>
     </body></html>
     """
+
+
+# =========================
+# NEW multisite endpoint
+# =========================
+@app.post("/sites/{site_id}/draft")
+def create_multisite_draft(
+    site_id: str,
+    title: str = Form(...),
+    content: str = Form(...),
+    excerpt: str = Form(""),
+    topic_key: str = Form("general"),
+):
+    """
+    Crée un brouillon sur le site WordPress identifié par site_id.
+    - Récupère site_url + secret HMAC dans la table sites
+    - Anti-duplicate par hash du content
+    - Appelle le plugin WP: POST /wp-json/llmgeo/v1/draft avec headers HMAC
+    - Enregistre l'article en base
+    """
+
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            # 1) site
+            cur.execute(
+                "SELECT site_url, secret FROM sites WHERE id = %s AND is_active = true",
+                (site_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Site non trouvé ou inactif")
+
+            site_url, secret = row
+
+            # 2) anti-duplicate
+            content_hash = sha256_hex(content)
+            cur.execute(
+                "SELECT wp_post_id, wp_url FROM articles WHERE site_id = %s AND content_hash = %s",
+                (site_id, content_hash),
+            )
+            dup = cur.fetchone()
+            if dup:
+                return {"status": "duplicate", "wp_post_id": dup[0], "wp_url": dup[1]}
+
+            # 3) call WP plugin
+            wp_path = "/wp-json/llmgeo/v1/draft"
+            wp_url = site_url.rstrip("/") + wp_path
+            ts = str(int(time.time()))
+
+            # IMPORTANT: signer EXACTEMENT le body envoyé (json string)
+            body = json.dumps(
+                {"title": title, "content": content, "excerpt": excerpt},
+                ensure_ascii=False,
+            )
+            sign = hmac_sign(secret, "POST", wp_path, ts, body)
+
+            try:
+                r = requests.post(
+                    wp_url,
+                    data=body.encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-LLMGEO-TS": ts,
+                        "X-LLMGEO-SIGN": sign,
+                    },
+                    timeout=60,
+                )
+            except RequestException as e:
+                raise HTTPException(status_code=502, detail=f"Erreur requête WP: {str(e)}")
+
+            if r.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"Erreur WP ({r.status_code}): {r.text}")
+
+            data = r.json()
+            wp_post_id = data.get("id")
+            wp_link = data.get("link")
+
+            # 4) store in DB
+            cur.execute(
+                """
+                INSERT INTO articles (
+                    site_id, wp_post_id, wp_status, wp_url,
+                    title, content_html, excerpt,
+                    topic_key, content_hash, meta
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
+                """,
+                (
+                    site_id,
+                    wp_post_id,
+                    "draft",
+                    wp_link,
+                    title,
+                    content,
+                    excerpt,
+                    topic_key,
+                    content_hash,
+                ),
+            )
+            conn.commit()
+
+            return {"status": "created", "wp_post_id": wp_post_id, "wp_url": wp_link}
