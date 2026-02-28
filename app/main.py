@@ -107,7 +107,11 @@ def create_draft(title: str = Form(...), content: str = Form(...)):
     wp = WordPressClient(WP_BASE_URL, WP_USERNAME, WP_APP_PASSWORD, timeout=60)
 
     try:
-        post = wp.create_draft_post(title=title, content_html=content, excerpt="Test GEO Engine")
+        post = wp.create_draft_post(
+            title=title,
+            content_html=content,
+            excerpt="Test GEO Engine"
+        )
     except ReadTimeout:
         return HTMLResponse("Timeout WP (brouillon probablement créé)")
     except RequestException as e:
@@ -119,14 +123,20 @@ def create_draft(title: str = Form(...), content: str = Form(...)):
 # =========================
 # CORE MULTI-SITE LOGIC
 # =========================
-def create_multisite_draft_internal(site_id: str, title: str, content: str, excerpt: str, topic_key: str):
+def create_multisite_draft_internal(
+    site_id: str,
+    title: str,
+    content: str,
+    excerpt: str,
+    topic_key: str,
+):
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
 
-            # 1️⃣ récupérer site
+            # 1️⃣ Récupérer le site
             cur.execute(
                 "SELECT site_url, secret FROM sites WHERE id = %s AND is_active = true",
-                (site_id,)
+                (site_id,),
             )
             site = cur.fetchone()
 
@@ -135,7 +145,7 @@ def create_multisite_draft_internal(site_id: str, title: str, content: str, exce
 
             site_url, secret = site
 
-            # 2️⃣ anti-duplicate (hash sur contenu de base, AVANT maillage)
+            # 2️⃣ Anti-duplicate (hash AVANT maillage)
             base_hash = sha256_hex(content)
 
             cur.execute(
@@ -151,7 +161,7 @@ def create_multisite_draft_internal(site_id: str, title: str, content: str, exce
                     "wp_url": duplicate[1],
                 }
 
-            # 3️⃣ maillage interne par cluster (topic_key)
+            # 3️⃣ Maillage interne par cluster (topic_key)
             cur.execute(
                 """
                 SELECT title, wp_url
@@ -173,13 +183,17 @@ def create_multisite_draft_internal(site_id: str, title: str, content: str, exce
                 internal_block += "</ul>"
                 content = content + "\n\n" + internal_block
 
-            # 4️⃣ appel plugin WP (HMAC)
+            # 4️⃣ Appel plugin WordPress (HMAC)
             wp_path = "/wp-json/llmgeo/v1/draft"
             wp_url = site_url.rstrip("/") + wp_path
             ts = str(int(time.time()))
 
             body_json = json.dumps(
-                {"title": title, "content": content, "excerpt": excerpt},
+                {
+                    "title": title,
+                    "content": content,
+                    "excerpt": excerpt,
+                },
                 ensure_ascii=False,
             )
 
@@ -201,7 +215,7 @@ def create_multisite_draft_internal(site_id: str, title: str, content: str, exce
 
             wp_json = response.json()
 
-            # 5️⃣ enregistrer en base
+            # 5️⃣ Enregistrement en base
             cur.execute(
                 """
                 INSERT INTO articles (
@@ -216,7 +230,7 @@ def create_multisite_draft_internal(site_id: str, title: str, content: str, exce
                     content_hash,
                     meta
                 )
-                VALUES (%s,%s,'draft',%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
                 """,
                 (
                     site_id,
@@ -251,7 +265,9 @@ def create_multisite_draft(
     excerpt: str = Form(""),
     topic_key: str = Form("general"),
 ):
-    return create_multisite_draft_internal(site_id, title, content, excerpt, topic_key)
+    return create_multisite_draft_internal(
+        site_id, title, content, excerpt, topic_key
+    )
 
 
 # =========================
