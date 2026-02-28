@@ -135,6 +135,29 @@ def create_multisite_draft_internal(site_id: str, title: str, content: str, exce
 
             site_url, secret = site
 
+            # 🔹 Récupérer anciens articles pour maillage interne
+cur.execute("""
+    SELECT title, wp_url
+    FROM articles
+    WHERE site_id = %s
+    ORDER BY created_at DESC
+    LIMIT 5
+""", (site_id,))
+
+related_articles = cur.fetchall()
+
+internal_block = ""
+
+if related_articles:
+    internal_block = "<h2>À lire aussi</h2><ul>"
+    for t, url in related_articles:
+        if url:
+            internal_block += f'<li><a href="{url}">{t}</a></li>'
+    internal_block += "</ul>"
+
+# Injecter à la fin du contenu
+content = content + internal_block
+
             # 2️⃣ anti-duplicate
             content_hash = sha256_hex(content)
 
