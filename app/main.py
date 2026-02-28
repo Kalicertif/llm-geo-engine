@@ -151,16 +151,18 @@ def create_multisite_draft_internal(site_id: str, title: str, content: str, exce
                     "wp_url": duplicate[1],
                 }
 
-            # 3️⃣ maillage interne simple (5 derniers)
+            # 3️⃣ maillage interne par cluster (topic_key)
             cur.execute(
                 """
                 SELECT title, wp_url
                 FROM articles
-                WHERE site_id = %s AND wp_url IS NOT NULL
+                WHERE site_id = %s
+                  AND wp_url IS NOT NULL
+                  AND topic_key = %s
                 ORDER BY created_at DESC
                 LIMIT 5
                 """,
-                (site_id,),
+                (site_id, topic_key),
             )
             related_articles = cur.fetchall()
 
@@ -214,11 +216,12 @@ def create_multisite_draft_internal(site_id: str, title: str, content: str, exce
                     content_hash,
                     meta
                 )
-                VALUES (%s,%s,'draft',%s,%s,%s,%s,%s,%s,'{}'::jsonb)
+                VALUES (%s,%s,'draft',%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
                 """,
                 (
                     site_id,
                     wp_json.get("id"),
+                    "draft",
                     wp_json.get("link"),
                     title,
                     content,
