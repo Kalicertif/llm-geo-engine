@@ -9,17 +9,12 @@ import random
 import requests
 import openai
 
-# =========================
-# Configuration
-# =========================
-
 app = FastAPI()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL manquant")
 
-# OpenAI config
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2-chat-latest")
 if not OPENAI_API_KEY:
@@ -30,18 +25,21 @@ openai.api_key = OPENAI_API_KEY
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
 MAX_MEDIA = int(os.getenv("MAX_MEDIA", "20"))
 
-# =========================
-# Pydantic Models
-# =========================
+# =====================
+# Models
+# =====================
 
 class GenerateIn(BaseModel):
-    topic_key: str = Field(..., description="Topic pour lequel générer l’article")
-    tone: str = Field(default="professionnel", description="Style tonalité")
-    images_count: int = Field(default=2, ge=0, le=3, description="Nombre max images à insérer")
+    topic_key: str = Field(..., description="Cluster / sujet à traiter")
+    frequency: str = Field(
+        default="1_per_week",
+        description="Fréquence retenue pour planification SEO"
+    )
+    images_count: int = Field(default=2, ge=0, le=3)
 
-# =========================
+# =====================
 # Helpers
-# =========================
+# =====================
 
 def db_connect():
     return psycopg.connect(DATABASE_URL)
@@ -142,18 +140,18 @@ def build_internal_links_block(cur, site_id: str, topic_key: str, limit: int = 5
     block += "</ul>"
     return block
 
-# =========================
-# OpenAI Integration
-# =========================
+# =====================
+# OpenAI prompt
+# =====================
 
 def openai_generate_article(prompt_text: str) -> dict:
     resp = openai.ChatCompletion.create(
         model=OPENAI_MODEL,
         messages=[
-            {"role":"system","content":"You generate SEO-optimized articles in JSON only."},
+            {"role":"system","content":"You generate SEO-optimized articles in structured JSON format only."},
             {"role":"user","content": prompt_text}
         ],
-        max_tokens=2500,
+        max_tokens=3000,
     )
     text = resp.choices[0].message.content.strip()
     try:
@@ -161,31 +159,43 @@ def openai_generate_article(prompt_text: str) -> dict:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OpenAI output parse error: {str(e)}")
 
-def build_openai_prompt(profile: dict, topic_key: str, style: str, lang: str) -> str:
-    area = ", ".join(profile.get("business",{}).get("service_area",[]))
-    company = profile.get("business",{}).get("company_name","")
+def build_openai_prompt(profile: dict, topic_key: str, frequency: str, lang: str) -> str:
+    site = profile.get("site",{}) or {}
+    biz = profile.get("business",{}) or {}
+    region = ", ".join(biz.get("service_area") or [])
+    company = biz.get("company_name","")
+    target = biz.get("target_audience","")
+
     prompt = f"""
-You are a professional SEO content writer.
-Generate a full article in JSON with keys: title, excerpt, content_html.
-Topic: {topic_key}
-Style: {style}
-Language: {lang}
-Region: {area}
-Company: {company}
+You are a professional SEO content writer tasked with generating a full article in JSON.
+Include sections, SEO structure, internal links, FAQs, meta title/tag, and incorporate region and audience.
+OUTPUT JSON with keys: title, excerpt, content_html.
 
-Rules:
-- Output valid JSON only.
-- The content_html must include <h1>…</h1>, sections, and useful info.
-- Include a FAQ section at the end.
-- Optimize for local search relevance.
+SITE PROFILE:
+  Company: {company}
+  Region: {region}
+  Audience: {target}
+  Services: {biz.get('primary_services')}
 
-Begin.
+TOPIC:
+  topic_key: {topic_key}
+  frequency: {frequency}
+
+LANGUAGE: {lang}
+
+RULES:
+- The output must be strictly valid JSON.
+- content_html should be HTML with headings (<h1>, <h2>, etc).
+- Include an FAQ section with at least 3 Q&A.
+- Integrate internal links and images where possible.
+
+BEGIN.
 """
     return prompt.strip()
 
-# =========================
+# =====================
 # Endpoints
-# =========================
+# =====================
 
 @app.get("/health")
 def health():
@@ -203,87 +213,66 @@ def analyze_site(site_id: str):
             memory_upsert(cur, site_id, "site_profile", profile)
             memory_upsert(cur, site_id, "media_cache", media)
 
-            # settings
-            settings = profile.get("settings", {})
-            memory_upsert(cur, site_id, "langs_enabled", settings.get("langs_enabled", ["fr"]))
-            memory_upsert(cur, site_id, "styles_enabled", settings.get("styles_enabled", ["guide","tips","problem"]))
-            memory_upsert(cur, site_id, "frequency", {"freq":settings.get("frequency","1_per_week")})
-
             conn.commit()
-            return {"status":"ok"}
 
-@app.get("/api/sites/{site_id}/topics")
-def topics(site_id: str):
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            profile = memory_get(cur, site_id, "site_profile")
-            if not profile:
-                raise HTTPException(status_code=400, detail="Site non analysé")
-
-            # Simple deterministic topics logic (tu peux étendre)
-            area = ", ".join((profile.get("business") or {}).get("service_area") or [])
-            company = (profile.get("business") or {}).get("company_name","")
-            base = []
-            base.append({"topic_key":f"guide-{area}","title":f"Guide {area}","angle":"guide","site":company})
-            return {"status":"ok","topics":base}
+    return {"status":"ok"}
 
 @app.post("/api/sites/{site_id}/generate-draft")
 def generate_draft(site_id: str, payload: GenerateIn):
     with db_connect() as conn:
         with conn.cursor() as cur:
+
             profile = memory_get(cur, site_id, "site_profile")
+            media = memory_get(cur, site_id, "media_cache")
             if not profile:
                 raise HTTPException(status_code=400, detail="Site non analysé")
 
-            langs = memory_get(cur, site_id, "langs_enabled") or ["fr"]
-            styles = memory_get(cur, site_id, "styles_enabled") or ["guide","tips","problem"]
+            # Select random language
+            lang = random.choice(profile.get("site",{}).get("language","fr_FR").split("_")[0])
 
-            # pick random lang & style
-            lang = random.choice(langs)
-            style = random.choice(styles)
-
-            prompt = build_openai_prompt(profile, payload.topic_key, style, lang)
+            prompt = build_openai_prompt(profile, payload.topic_key, payload.frequency, lang)
             out = openai_generate_article(prompt)
 
             title = out.get("title","")
             excerpt = out.get("excerpt","")
             content_html = out.get("content_html","")
 
-            # duplicate check
+            # Duplicate check
             h = sha256_hex(content_html)
             cur.execute("SELECT wp_post_id FROM articles WHERE site_id=%s AND content_hash=%s",(site_id,h))
             dup = cur.fetchone()
             if dup:
                 return {"status":"duplicate"}
 
-            # internal links
-            block = build_internal_links_block(cur, site_id, payload.topic_key)
-            if block:
-                content_html += "\n\n" + block
+            internal_block = build_internal_links_block(cur, site_id, payload.topic_key)
+            if internal_block:
+                content_html += "\n\n" + internal_block
 
-            body_json = json.dumps({"title":title,"content":content_html,"excerpt":excerpt}, ensure_ascii=False)
+            body = json.dumps({"title":title,"content":content_html,"excerpt":excerpt}, ensure_ascii=False)
             site_url, secret = get_site(cur, site_id)
-            wp_json = wp_signed_post(site_url, secret, "/wp-json/llmgeo/v1/draft", body_json)
+            wp_resp = wp_signed_post(site_url, secret, "/wp-json/llmgeo/v1/draft", body)
 
             cur.execute(
                 """
                 INSERT INTO articles (
                     site_id, wp_post_id, wp_status, wp_url,
                     title, content_html, excerpt, topic_key, content_hash, meta
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
                 """,
                 (
                     site_id,
-                    wp_json.get("id"),
+                    wp_resp.get("id"),
                     "draft",
-                    wp_json.get("link"),
+                    wp_resp.get("link"),
                     title,
                     content_html,
                     excerpt,
                     payload.topic_key,
                     h,
-                    json.dumps({"lang":lang,"style":style}, ensure_ascii=False)
+                    json.dumps({"frequency":payload.frequency}, ensure_ascii=False)
                 ),
             )
             conn.commit()
-            return {"status":"created","wp_url":wp_json.get("link")}
+
+            return {"status":"created","wp_url":wp_resp.get("link")}
